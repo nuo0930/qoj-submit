@@ -1,0 +1,3 @@
+submit text eol=lf
+*.sh text eol=lf
+test_submit.py text eol=lf

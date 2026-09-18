@@ -19,3 +19,4 @@ submission/
 *.c
 *.py
 !install.sh
+!test_submit.py

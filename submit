@@ -34,11 +34,12 @@ import time
 import uuid
 from http.client import HTTPMessage, IncompleteRead, RemoteDisconnected
 from http.cookies import SimpleCookie
+from html.parser import HTMLParser
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Tuple
 from urllib.error import URLError
-from urllib.parse import urlencode, urljoin, urlparse, urlunparse
-from urllib.request import urlopen
+from urllib.parse import urlencode, urljoin, urlparse, urlunparse, parse_qsl, unquote
+from urllib.request import urlopen, getproxies, proxy_bypass
 
 
 def _venv_python_candidates() -> List[Path]:
@@ -89,7 +90,7 @@ def _curl_cffi_install_hint() -> str:
     )
 
 
-VERSION = "1.0.0"
+VERSION = "1.2.0"
 APP_NAME = "qoj-xcpc"
 DEFAULT_SITE = "https://qoj.ac"
 CF_SITE = "https://codeforces.com"
@@ -539,12 +540,15 @@ class Client:
     def _rebuild_opener(self) -> None:
         self._drop_conn()
         self._ssl_ctx = ssl.create_default_context()
+        previous = getattr(self, "_cffi", None)
+        if previous is not None:
+            previous.close()
         self._cffi = None
         self._used_cffi = False
 
     def _host_needs_impersonate(self, url: str) -> bool:
         host = (urlparse(url).hostname or urlparse(self.site).hostname or "").lower()
-        return "codeforces" in host
+        return bool(host)
 
     def _impersonate_candidates(self) -> List[str]:
         ua = self.user_agent or ""
@@ -565,7 +569,7 @@ class Client:
         last: Optional[BaseException] = None
         for name in self._impersonate_candidates():
             try:
-                self._cffi = cffi_requests.Session(impersonate=name)
+                self._cffi = cffi_requests.Session(impersonate=name, trust_env=True)
                 if self.debug:
                     print(f"DEBUG impersonate={name}", file=sys.stderr)
                 return self._cffi
@@ -589,6 +593,8 @@ class Client:
         session = self._cffi_session()
         if session is None:
             return None
+        if self.debug:
+            print("DEBUG transport=curl_cffi (environment proxy enabled)", file=sys.stderr)
         for key, value in self.cookies.items():
             if not key:
                 continue
@@ -603,28 +609,16 @@ class Client:
         }
         if extra_headers:
             hdrs.update({k: v for k, v in extra_headers.items() if k.lower() not in ("host", "connection")})
-        follow = follow_redirects or (data is None and method.upper() == "GET")
+        follow = False  # _request owns redirects and the shared timeout budget.
         try:
             resp = session.request(
                 method,
                 url,
                 data=data,
                 headers=hdrs,
-                timeout=(sock_timeout, read_timeout),
+                timeout=read_timeout,
                 allow_redirects=follow,
             )
-        except TypeError:
-            try:
-                resp = session.request(
-                    method,
-                    url,
-                    data=data,
-                    headers=hdrs,
-                    timeout=max(sock_timeout, read_timeout),
-                    allow_redirects=follow,
-                )
-            except Exception as exc:
-                raise OSError(str(exc)) from exc
         except Exception as exc:
             raise OSError(str(exc)) from exc
         try:
@@ -684,23 +678,40 @@ class Client:
             except Exception:
                 pass
 
-    def _connection(self, parsed, timeout: float) -> http.client.HTTPSConnection:
+    def _connection(self, parsed, timeout: float):
         host = parsed.hostname or "qoj.ac"
-        port = parsed.port or 443
-        key = f"{host}:{port}"
+        secure = parsed.scheme == "https"
+        port = parsed.port or (443 if secure else 80)
+        proxies = getproxies()
+        proxy = "" if proxy_bypass(host) else (proxies.get(parsed.scheme) or proxies.get("all") or "")
+        key = f"{parsed.scheme}://{host}:{port}|{proxy}"
         if self._conn is not None and self._conn_host == key:
             self._conn.timeout = timeout
             if getattr(self._conn, "sock", None) is not None:
-                try:
-                    self._conn.sock.settimeout(timeout)
-                except Exception:
-                    pass
+                self._conn.sock.settimeout(timeout)
             return self._conn
         self._drop_conn()
-        conn = http.client.HTTPSConnection(host, port, timeout=timeout, context=self._ssl_ctx)
-        self._conn = conn
-        self._conn_host = key
+        tunnel_headers = {}
+        endpoint, endpoint_port = host, port
+        if proxy:
+            pp = urlparse(proxy if "://" in proxy else "http://" + proxy)
+            if pp.scheme != "http" or not pp.hostname:
+                raise OSError("此代理需要 curl_cffi，请运行 ./install.sh 更新依赖")
+            endpoint, endpoint_port = pp.hostname, pp.port or 80
+            if pp.username is not None:
+                auth = unquote(pp.username) + ":" + unquote(pp.password or "")
+                tunnel_headers["Proxy-Authorization"] = "Basic " + base64.b64encode(auth.encode()).decode()
+        if secure:
+            conn = http.client.HTTPSConnection(endpoint, endpoint_port, timeout=timeout, context=self._ssl_ctx)
+        else:
+            conn = http.client.HTTPConnection(endpoint, endpoint_port, timeout=timeout)
+        if proxy:
+            conn.set_tunnel(host, port, headers=tunnel_headers)
+        if self.debug:
+            print("DEBUG transport=stdlib route=" + ("proxy" if proxy else "direct"), file=sys.stderr)
+        self._conn, self._conn_host = conn, key
         return conn
+
 
     def set_cookie_header(self, header: str) -> None:
         header = parse_cookie_input(header)
@@ -725,13 +736,19 @@ class Client:
                     self.cookies[name] = morsel.value
 
     @staticmethod
-    def _read_body(fp, limit: int = 8 * 1024 * 1024, deadline: Optional[float] = None) -> bytes:
+    def _read_body(fp, limit: int = 8 * 1024 * 1024, deadline: Optional[float] = None, sock=None) -> bytes:
         chunks: List[bytes] = []
         n = 0
         while n < limit:
-            if deadline is not None and time.time() > deadline:
-                raise TimeoutError("read deadline")
-            piece = fp.read(min(65536, limit - n))
+            if deadline is not None:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError("read deadline")
+                if sock is not None:
+                    sock.settimeout(remaining)
+            # read(n) can wait indefinitely for n bytes when a peer trickles data.
+            reader = getattr(fp, "read1", fp.read)
+            piece = reader(min(65536, limit - n))
             if not piece:
                 break
             chunks.append(piece)
@@ -775,17 +792,27 @@ class Client:
             if cookie and "Cookie" not in extra_headers:
                 hdrs["Cookie"] = cookie
         last_err: Optional[BaseException] = None
+        deadline = time.monotonic() + read_timeout
         for reconnect in range(2):
-            conn = self._connection(parsed, sock_timeout)
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("request deadline")
+            conn = self._connection(parsed, min(sock_timeout, remaining))
             try:
                 conn.request(method, path, body=data, headers=hdrs)
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError("request deadline")
+                response_sock = getattr(conn, "sock", None)
+                if response_sock is not None:
+                    response_sock.settimeout(remaining)
                 resp = conn.getresponse()
                 status = resp.status
                 loc = resp.getheader("Location") or ""
                 ctype = resp.getheader("Content-Type") or ""
                 cenc = (resp.getheader("Content-Encoding") or "").lower()
                 self._absorb_set_cookie(resp.headers)
-                raw = self._read_body(resp, deadline=time.time() + read_timeout)
+                raw = self._read_body(resp, deadline=deadline, sock=response_sock)
                 if cenc == "gzip" and raw:
                     try:
                         raw = gzip.decompress(raw)
@@ -800,7 +827,7 @@ class Client:
             except (BrokenPipeError, ConnectionResetError, RemoteDisconnected) as exc:
                 last_err = exc
                 self._drop_conn()
-                if reconnect == 0:
+                if reconnect == 0 and method.upper() in ("GET", "HEAD"):
                     continue
                 raise
             except (ssl.SSLError, TimeoutError, socket.timeout, OSError):
@@ -824,8 +851,11 @@ class Client:
         attempts = max(1, retries + 1)
         last_err: Optional[BaseException] = None
         is_post = data is not None
+        if is_post:
+            # Confirmation may leave the keep-alive socket idle for minutes.
+            self._drop_conn()
         method = (method or ("POST" if is_post else "GET")).upper()
-        sock_timeout = 12
+        deadline = time.monotonic() + max(0.1, timeout)
         current = url
         send_data = data
         send_method = method
@@ -834,10 +864,18 @@ class Client:
         for attempt in range(attempts):
             if self.debug:
                 print(f"DEBUG {send_method} {current} (try {attempt + 1}/{attempts})", file=sys.stderr)
-            read_timeout = 15 if send_post else max(12, timeout)
             redirects = 0
+            remaining_total = max(0, deadline - time.monotonic())
+            attempts_left = attempts - attempt
+            # Reserve time for later GET attempts, including their backoff.
+            allowance = remaining_total if is_post else max(0, remaining_total - 0.4 * (attempts_left - 1)) / attempts_left
+            attempt_deadline = min(deadline, time.monotonic() + allowance)
             try:
                 while True:
+                    remaining = attempt_deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise TimeoutError("request deadline（读取页面预算耗尽）")
+                    sock_timeout, read_timeout = min(12, remaining), remaining
                     status, loc, raw, encoding = self._http_once(
                         current, send_data, headers, send_method, sock_timeout, read_timeout,
                         follow_redirects=follow_redirects,
@@ -885,9 +923,7 @@ class Client:
                 last_err = exc
                 kind = _network_error_kind(exc)
                 handshake_ok = kind == "handshake"
-                can_retry = attempt + 1 < attempts and (
-                    handshake_ok or (not send_post and kind in ("handshake", "timeout"))
-                )
+                can_retry = attempt + 1 < attempts and not is_post and deadline - time.monotonic() > 0.4 * (attempt + 1)
                 if can_retry:
                     if handshake_ok:
                         info(f"TLS 握手超时，正在重试 ({attempt + 2}/{attempts})...")
@@ -926,6 +962,7 @@ class Client:
         timeout: int = 25,
         referer: Optional[str] = None,
         follow_redirects: bool = False,
+        fatal: bool = True,
     ) -> Tuple[int, str, str]:
         data = urlencode(fields).encode("utf-8")
         headers = {
@@ -936,7 +973,7 @@ class Client:
             headers["Referer"] = referer
         return self._request(
             url, data=data, headers=headers, timeout=timeout, retries=2,
-            follow_redirects=follow_redirects,
+            follow_redirects=follow_redirects, fatal=fatal,
         )
 
     def post_multipart(
@@ -1521,6 +1558,46 @@ def parse_cf_contest_problems(
     return problems
 
 
+def fetch_cf_contest_via_api(
+    client: Client, site: str, contest_id: str, kind: str
+) -> Optional[Tuple[str, Dict[str, dict]]]:
+    api = (
+        f"{site.rstrip('/')}/api/contest.standings?"
+        + urlencode({"contestId": str(contest_id), "from": "1", "count": "1"})
+    )
+    try:
+        status, _, body = client.get(api, timeout=5, retries=0, fatal=False)
+    except (TimeoutError, OSError):
+        return None
+    text = (body or "").lstrip()
+    if status >= 400 or not text.startswith("{"):
+        return None
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError:
+        return None
+    if str(data.get("status") or "").upper() != "OK":
+        return None
+    result = data.get("result") or {}
+    name = str((result.get("contest") or {}).get("name") or "").strip()
+    problems: Dict[str, dict] = {}
+    for item in result.get("problems") or []:
+        letter = str(item.get("index") or "").upper()
+        if not re.fullmatch(r"[A-Z]{1,2}\d*", letter):
+            continue
+        title = str(item.get("name") or letter).strip() or letter
+        problems[letter] = {
+            "id": letter,
+            "title": title,
+            "url": f"{site.rstrip('/')}/{kind}/{contest_id}/problem/{letter}",
+        }
+    if not problems:
+        return None
+    if not name or _is_junk_contest_name(name):
+        name = f"Contest {contest_id}"
+    return name, problems
+
+
 _JUNK_CONTEST_NAMES = {
     "dashboard",
     "codeforces",
@@ -1614,20 +1691,79 @@ def parse_contest_name(page: str, site: str = "", contest_id: str = "") -> str:
     return ""
 
 
+class _StatusMarkup(HTMLParser):
+    """Collect nested text and semantic status attributes without truncating spans."""
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.nodes = []
+        self.stack = []
+        self.text = []
+
+    def handle_starttag(self, tag, attrs):
+        node = {"tag": tag, "attrs": dict(attrs), "text": []}
+        self.nodes.append(node)
+        if tag not in {"area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "param", "source", "track", "wbr"}:
+            self.stack.append(node)
+
+    def handle_startendtag(self, tag, attrs):
+        self.handle_starttag(tag, attrs)
+        self.handle_endtag(tag)
+
+    def handle_endtag(self, tag):
+        for i in range(len(self.stack) - 1, -1, -1):
+            if self.stack[i]["tag"] == tag:
+                del self.stack[i:]
+                break
+
+    def handle_data(self, data):
+        if any(n["tag"] in {"script", "style"} for n in self.stack):
+            return
+        self.text.append(data)
+        for node in self.stack:
+            node["text"].append(data)
+
+
+def _status_from_markup(markup: str, marked_only: bool = False) -> str:
+    parsed = _StatusMarkup()
+    parsed.feed(markup)
+    candidates = []
+    for node in parsed.nodes:
+        attrs = node["attrs"]
+        classes = (attrs.get("class") or "").split()
+        marked = any("status" in c or "verdict" in c for c in classes)
+        marked = marked or bool(attrs.get("data-verdict") or attrs.get("data-status"))
+        if marked_only and not marked:
+            continue
+        # Text wins over styling: a generic rejected class may contain TLE/RE.
+        candidates.append(" ".join(node["text"]))
+        candidates.extend(attrs.get(key) or "" for key in
+                          ("data-verdict", "data-status", "title", "data-original-title", "aria-label"))
+        for cls in classes:
+            if cls.startswith(("uoj-status-", "verdict-")):
+                candidates.append(re.sub(r"^(?:uoj-status-|verdict-)", "", cls).replace("-", " "))
+    if not marked_only:
+        candidates.append(" ".join(parsed.text))
+    generic = ""
+    for candidate in candidates:
+        verdict = short_verdict(candidate)
+        if not candidate.strip() or verdict == "UNKNOWN":
+            continue
+        if verdict == "REJECT":
+            generic = candidate.strip()
+            continue
+        return candidate.strip()
+    return generic
+
+
 def _uoj_status_text(html: str) -> str:
-    m = re.search(
-        r'class=["\'][^"\']*uoj-status[^"\']*["\'][^>]*>(.*?)</(?:a|span|div|td|b)',
-        html or "",
-        re.I | re.S,
-    )
-    if m:
-        return strip_html(m.group(1))
-    return ""
+    return _status_from_markup(html, marked_only=True)
 
 
 def parse_submission_rows(page: str) -> List[dict]:
     rows = []
     seen = set()
+    headers = [strip_html(x).strip().lower() for x in re.findall(r"<th\b[^>]*>(.*?)</th>", page, re.I | re.S)]
+    result_columns = [i for i, h in enumerate(headers) if h in {"status", "result", "verdict", "状态", "结果", "评测结果", "score", "得分"}]
     for tr in re.findall(r"<tr\b[^>]*>(.*?)</tr>", page, re.I | re.S):
         sid_m = re.search(r"/submission/(\d+)", tr)
         if not sid_m:
@@ -1657,19 +1793,27 @@ def parse_submission_rows(page: str) -> List[dict]:
                 um = re.search(r"/user/profile/([^/?#'\"]+)", href)
                 if um:
                     submitter = htmlmod.unescape(um.group(1))
-        cells = [strip_html(td) for td in re.findall(r"<td\b[^>]*>(.*?)</td>", tr, re.I | re.S)]
-        status = _uoj_status_text(tr)
-        if not status:
-            for cell in cells:
-                low = cell.lower()
-                if any(k in low for k in (
-                    "accept", "wrong", "error", "limit", "judg", "wait", "compil",
-                    "runtime", "point", "score", "正确", "错误", "超限", "评测", "等待",
-                )):
-                    status = cell
+        raw_cells = re.findall(r"<td\b[^>]*>.*?</td>", tr, re.I | re.S)
+        cells = [strip_html(td) for td in raw_cells]
+        status = ""
+        for index in result_columns:
+            if index < len(raw_cells):
+                status = _status_from_markup(raw_cells[index])
+                if not status and headers[index] in {"score", "得分"}:
+                    score = strip_html(raw_cells[index])
+                    if re.fullmatch(r"100(?:\.0+)?", score):
+                        status = "Accepted"
+                if status:
                     break
-        if not status and len(cells) >= 5:
-            status = cells[4] if len(cells) > 4 else cells[-1]
+        status = status or _uoj_status_text(tr)
+        if not status:
+            for cell in raw_cells:
+                # Never interpret problem titles, usernames, or submission IDs as verdicts.
+                if re.search(r'href=["\'][^"\']*/(?:problem/|user/profile/)', cell, re.I):
+                    continue
+                status = _status_from_markup(cell)
+                if status:
+                    break
         rows.append({
             "id": sid,
             "problem": problem,
@@ -1679,6 +1823,7 @@ def parse_submission_rows(page: str) -> List[dict]:
             "status": status or "?",
             "cells": cells,
             "submit_ts": _parse_submit_clock(cells),
+            "submit_time": submission_time_text(tr),
             "url_path": f"/submission/{sid}",
         })
     return rows
@@ -1723,6 +1868,29 @@ def _submission_row_matches(
     if known and row_pid:
         return row_pid in known
     return True
+
+
+def submission_time_text(markup: str) -> str:
+    parsed = _StatusMarkup()
+    parsed.feed(markup)
+    candidates = []
+    for node in parsed.nodes:
+        # Prefer the visible date; attributes supply dates for relative-time labels.
+        if node["tag"] in {"td", "time", "span", "a"}:
+            candidates.append(" ".join(node["text"]))
+            candidates.extend(node["attrs"].get(key) or "" for key in
+                              ("datetime", "title", "data-original-title"))
+    patterns = (
+        r"\b20\d{2}-\d{2}-\d{2}[T\s]+\d{2}:\d{2}(?::\d{2})?(?:Z|[+-]\d{2}:\d{2})?",
+        r"\b[A-Za-z]{3}/\d{1,2}/20\d{2}\s+\d{2}:\d{2}(?::\d{2})?",
+        r"\b\d{1,2}\.[A-Za-z]{3}\.20\d{2}\s+\d{2}:\d{2}(?::\d{2})?",
+    )
+    for candidate in candidates:
+        for pattern in patterns:
+            match = re.search(pattern, candidate)
+            if match:
+                return re.sub(r"(?<=\d)T(?=\d)", " ", re.sub(r"\s+", " ", match.group(0)))
+    return "-"
 
 
 def _parse_submit_clock(cells: List[str]) -> Optional[float]:
@@ -2041,6 +2209,12 @@ def copy_self_to(dest_dir: Path) -> Optional[Path]:
     if dest.resolve() == src:
         return dest
     data = src.read_bytes()
+    if dest.is_file():
+        try:
+            if dest.read_bytes() == data:
+                return dest
+        except OSError:
+            pass
     dest.write_bytes(data)
     try:
         dest.chmod(dest.stat().st_mode | 0o111)
@@ -3487,38 +3661,35 @@ def cmd_logout(args: argparse.Namespace) -> None:
 
 
 def cmd_whoami(args: argparse.Namespace) -> None:
+    if getattr(args, "timeout", 15) <= 0:
+        die("--timeout 必须大于 0")
+    if args.debug:
+        print(f"DEBUG script={Path(__file__).resolve()} version={VERSION}", file=sys.stderr)
     cfg = load_global()
     site = (cfg.get("site") or DEFAULT_SITE).rstrip("/")
     acc = get_account(cfg, site)
+    hint = "python3 submit login cf" if is_codeforces(site) else "python3 submit login"
     if not acc.get("cookie"):
-        hint = "python3 submit login cf" if is_codeforces(site) else "python3 submit login"
         die(f"{account_key(site)} 未登录。请先: {hint}")
-    client = Client(
-        site,
-        cookie=acc.get("cookie") or "",
-        user_agent=acc.get("user_agent") or cfg.get("user_agent") or DEFAULT_UA,
-        debug=args.debug,
-    )
-    probe = "/enter" if is_codeforces(site) else "/"
-    status, url, page = client.get(probe, fatal=False)
-    expect = acc.get("username") or ""
-    logged = looks_logged_in(page, url, expect=expect)
-    if not logged and is_codeforces(site):
-        logged = _cf_cookie_logged_in(acc.get("cookie") or "")
-    if not logged:
-        hint = "python3 submit login cf" if is_codeforces(site) else "python3 submit login"
-        die(f"{account_key(site)} Cookie 已失效，请重新: {hint}")
-    username = extract_username(page) or expect or "?"
-    if is_codeforces(site) and (not username or username == "?"):
-        username = (
-            extract_cf_handle_from_url(url)
-            or _cf_handle_from_firefox_profile(_firefox_default_profile("", "codeforces.com"))
-            or expect
-            or "?"
-        )
-        if username and username != "?" and username != expect:
-            save_account(cfg, site, acc.get("cookie") or "", acc.get("user_agent") or "", username)
-    ok(f"{username} @ {client.site}")
+    username = acc.get("username") or cookie_names(acc["cookie"]).get("uoj_username") or ""
+    if not getattr(args, "check", False):
+        ok(f"{username or '(未知账号)'} @ {site}（本地记录，未联网验证）")
+        info("验证登录是否有效: ./submit whoami --check")
+        return
+    client = Client(site, cookie=acc["cookie"],
+                    user_agent=acc.get("user_agent") or cfg.get("user_agent") or DEFAULT_UA,
+                    debug=args.debug)
+    info("正在验证登录状态...")
+    try:
+        status, url, page = client.get("/", timeout=getattr(args, "timeout", 15), retries=1, fatal=False)
+    except (TimeoutError, OSError) as exc:
+        die(f"登录验证失败: {exc}。网络异常，无法判断 Cookie 是否有效")
+    if _is_cloudflare_block(page) or status != 200:
+        die(f"登录验证失败（HTTP {status} 或页面被拦截），无法判断 Cookie 是否有效")
+    if not looks_logged_in(page, url, expect=username):
+        die(f"未能确认登录状态，请在浏览器检查或重新运行: {hint}")
+    username = extract_username(page) or extract_cf_handle_from_url(url) or username or "?"
+    ok(f"{username} @ {site}（已联网验证）")
 
 
 def parse_contest_ref(
@@ -3558,19 +3729,31 @@ def bind_contest(
         contest_url = f"{site}/contest/{contest_id}"
         kind = "contest"
     client = make_client(cfg, {"site": site}, debug=debug)
-    status, url, page = client.get(contest_url)
-    expect = get_account(cfg, site).get("username") or ""
-    if not looks_logged_in(page, url, expect=expect) and (
-        "/login" in url or "/enter" in url
-    ):
-        hint = "python3 submit login cf" if is_codeforces(site) else "python3 submit login"
-        die(f"未登录或 Cookie 失效，请先 {hint}")
-
-    problems = parse_contest_problems(page, site, contest_id, kind)
+    page = ""
+    url = contest_url
+    problems: Dict[str, dict] = {}
+    name = ""
+    if is_codeforces(site):
+        got = fetch_cf_contest_via_api(client, site, contest_id, kind)
+        if got:
+            name, problems = got
     if not problems:
-        hint = "python3 submit login cf" if is_codeforces(site) else "python3 submit login"
-        die(f"没有解析到题目。请确认已经登录（{hint}），且比赛 UID 正确")
-    name = parse_contest_name(page, site, contest_id)
+        try:
+            status, url, page = client.get(contest_url, timeout=10, retries=0, fatal=False)
+        except (TimeoutError, OSError) as exc:
+            die(f"打开比赛页超时: {exc}")
+        expect = get_account(cfg, site).get("username") or ""
+        if not looks_logged_in(page, url, expect=expect) and (
+            "/login" in url or "/enter" in url
+        ):
+            hint = "python3 submit login cf" if is_codeforces(site) else "python3 submit login"
+            die(f"未登录或 Cookie 失效，请先 {hint}")
+        problems = parse_contest_problems(page, site, contest_id, kind)
+        if not problems:
+            hint = "python3 submit login cf" if is_codeforces(site) else "python3 submit login"
+            die(f"没有解析到题目。请确认已经登录（{hint}），且比赛 UID 正确")
+        name = parse_contest_name(page, site, contest_id)
+    expect = get_account(cfg, site).get("username") or ""
     if not name or _is_junk_contest_name(name):
         name = f"Contest {contest_id}"
     username = extract_username(page) or expect
@@ -3667,6 +3850,8 @@ def _fetch_problem_submit_page(
     best_page = ""
     best_final = base
     best_status = 404
+    deadline = time.monotonic() + 30
+    last_error = None
     while queue and len(seen) < 5:
         url = queue.pop(0)
         if url in seen:
@@ -3674,13 +3859,20 @@ def _fetch_problem_submit_page(
         seen.add(url)
         if on_fetch:
             on_fetch(url)
-        status, final, page = client.get(url, timeout=10, retries=0)
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        try:
+            status, final, page = client.get(url, timeout=min(15, remaining), retries=1, fatal=False)
+        except (TimeoutError, OSError) as exc:
+            last_error = exc
+            continue
         last = (status, final, page)
         for extra in iter_submit_hrefs(page, final or url):
             if extra not in seen:
-                queue.append(extra)
+                queue.insert(0, extra)
         action = extract_form_action(page, final or url)
-        if extract_token(page):
+        if status == 200 and extract_token(page) and _has_submit_form(page):
             post_to = action or (final or url).split("#")[0]
             return post_to, status, final, page
         if not best_page and looks_logged_in(page, final):
@@ -3690,6 +3882,8 @@ def _fetch_problem_submit_page(
             best_status = status
     if best_page:
         return best_post, best_status, best_final, best_page
+    if last_error and not last[2]:
+        raise last_error
     status, final, page = last
     return (final or base).split("#")[0], status, final, page
 
@@ -3739,31 +3933,111 @@ def cmd_problems(args: argparse.Namespace) -> None:
     _print_problems(contest.get("problems") or {})
 
 
+def short_verdict(value: str) -> str:
+    text = strip_html(value).strip()
+    low = re.sub(r"[_\s]+", " ", text.lower())
+    aliases = {
+        "accepted": "AC", "accept": "AC", "ok": "AC", "正确": "AC", "答案正确": "AC",
+        "wrong answer": "WA", "答案错误": "WA",
+        "time limit exceeded": "TLE", "时间超限": "TLE",
+        "memory limit exceeded": "MLE", "内存超限": "MLE",
+        "runtime error": "RE", "运行错误": "RE",
+        "compilation error": "CE", "compile error": "CE", "编译错误": "CE",
+        "output limit exceeded": "OLE", "输出超限": "OLE",
+        "judgment failed": "JE", "system error": "JE",
+        "dangerous syscall": "DGS", "restricted function": "RF",
+        "partially correct": "PC", "partial": "PC", "rejected": "REJECT",
+        "reject": "REJECT", "skipped": "SKIPPED", "challenged": "HACKED",
+        "compiling": "COMPILING", "running": "JUDGING", "judging": "JUDGING",
+        "testing": "JUDGING", "pending": "PENDING", "waiting": "PENDING",
+        "in queue": "PENDING", "queued": "PENDING", "waiting for judge": "PENDING",
+        "等待评测": "PENDING", "等待": "PENDING", "评测中": "JUDGING", "评测": "JUDGING",
+        "编译中": "COMPILING", "judgement failed": "JE", "judgement error": "JE",
+        "presentation error": "PE", "no output": "NO_OUTPUT", "cancelled": "CANCELLED",
+    }
+    for key, result in aliases.items():
+        if re.match(re.escape(key) + r"(?:$|[\s(:：.\[!])", low):
+            return result
+    m = re.match(r"^(AC|WA|TLE|MLE|RE|CE|OLE|JE|PC|RF|DGS|PE)\b", text, re.I)
+    return m.group(1).upper() if m else "UNKNOWN"
+
+
+def validate_submission_page(status: int, url: str, page: str) -> None:
+    if re.search(r"/(?:login|enter)(?:[/?#]|$)", url):
+        raise OSError("登录已失效，请运行 ./submit login")
+    if _is_cloudflare_block(page):
+        raise OSError("提交列表被 Cloudflare 拦截，请重新登录")
+    if status != 200:
+        raise OSError(f"提交列表 HTTP {status}")
+    if not re.search(r"<table\b", page, re.I):
+        raise OSError("未找到提交列表，无法确认是否存在提交记录")
+
+
+def fetch_all_contest_submissions(client: Client, contest: dict, limit: int = 0) -> List[dict]:
+    cf = is_codeforces(contest.get("site") or "")
+    base = str(contest["contest_url"]).rstrip("/") + ("/my" if cf else "/submissions")
+    username = str(contest.get("username") or "")
+    if not cf and not username:
+        raise OSError("无法确定当前账号，请运行 ./submit login")
+    first = base if cf else base + "?" + urlencode({"submitter": username})
+    queue, visited, seen, rows = [first], set(), set(), []
+    parser = parse_cf_submission_rows if cf else parse_submission_rows
+    while queue:
+        url = queue.pop(0)
+        if url in visited:
+            continue
+        visited.add(url)
+        status, final, page = client.get(url, retries=1, fatal=False)
+        validate_submission_page(status, final, page)
+        for row in parser(page):
+            if not _submission_row_matches(row, contest):
+                continue
+            if row["id"] not in seen:
+                seen.add(row["id"])
+                rows.append(row)
+        if limit and len(rows) >= limit:
+            break
+        # Follow only pagination links for this contest's submissions endpoint.
+        for href in re.findall(r'href=["\']([^"\']+)["\']', page, re.I):
+            target = urljoin(final, htmlmod.unescape(href)).split("#")[0]
+            parsed, root = urlparse(target), urlparse(base)
+            if parsed.netloc != root.netloc or parsed.scheme != root.scheme:
+                continue
+            query = dict(parse_qsl(parsed.query))
+            path_ok = parsed.path == root.path or bool(re.fullmatch(re.escape(root.path) + r"/page/\d+", parsed.path))
+            page_link = "page" in query or bool(re.search(r"/page/\d+$", parsed.path))
+            if path_ok and page_link and set(query) <= {"page", "locale", "submitter"}:
+                if not cf:
+                    query["submitter"] = username
+                    target = urlunparse(parsed._replace(query=urlencode(query)))
+                if target not in visited and target not in queue:
+                    queue.append(target)
+    rows.sort(key=lambda row: int(row["id"]), reverse=True)
+    return rows[:limit] if limit else rows
+
+
 def cmd_status(args: argparse.Namespace) -> None:
+    if args.limit < 0:
+        die("--limit 不能为负数，0 表示全部")
     cfg = load_global()
     _, contest = require_contest()
+    contest = dict(contest)
+    contest["username"] = get_account(cfg, contest.get("site") or "").get("username") or contest.get("username") or ""
     client = make_client(cfg, contest, debug=args.debug)
-    name = contest_display_name(contest)
-    cid = contest.get("contest_id") or "?"
-    info(f"{name}  UID {cid}")
     try:
-        if is_codeforces(contest.get("site") or ""):
-            rows = fetch_cf_submission_rows(client, contest)
-            board = str(contest["contest_url"]).rstrip("/") + "/my"
-        else:
-            rows = fetch_submission_rows(client, contest, site_wide=False)
-            board = str(contest["contest_url"]).rstrip("/") + "/submissions"
+        rows = fetch_all_contest_submissions(client, contest, args.limit)
     except (TimeoutError, OSError) as exc:
-        die(f"提交列表超时: {exc}\n请再试: ./submit status")
-        return
+        die(f"读取提交列表失败: {exc}")
     if not rows:
-        warn("本场还没有提交记录")
-        info(f"评测板: {board}")
+        info("你在本场还没有可见提交记录")
         return
-    print(paint(f"{'ID':<10} {'Problem':<28} Result", "1"))
-    for row in rows[: args.limit]:
-        label = _contest_problem_label(contest, row) or row.get("problem") or "?"
-        print(f"{row['id']:<10} {label[:28]:<28} {verdict_color(row['status'])}")
+    print(f"{'ID':<12} {'Problem':<8} {'Status':<12} Submitted")
+    labels = {str(item["id"]): letter for letter, item in contest.get("problems", {}).items()}
+    for row in rows:
+        label = labels.get(str(row.get("problem_id")), row.get("problem_id") or "?")
+        verdict = short_verdict(row["status"])
+        submitted = row.get("submit_time") or "-"
+        print(f"{row['id']:<12} {label:<8} {verdict_color(f'{verdict:<12}')} {submitted}")
 
 
 def resolve_source(name: str) -> Path:
@@ -3881,7 +4155,8 @@ def fetch_submission_rows(
     last_err: Optional[BaseException] = None
     for url in submissions_list_urls(contest, problem_id, site_wide=site_wide):
         try:
-            _, _, page = client.get(url, timeout=timeout, retries=retries, fatal=False)
+            status, final, page = client.get(url, timeout=timeout, retries=retries, fatal=False)
+            validate_submission_page(status, final, page)
         except (TimeoutError, OSError) as exc:
             last_err = exc
             continue
@@ -3889,8 +4164,7 @@ def fetch_submission_rows(
             row for row in parse_submission_rows(page)
             if _submission_row_matches(row, contest, problem_id)
         ]
-        if rows:
-            return rows
+        return rows
     if last_err:
         raise last_err
     return []
@@ -3932,6 +4206,7 @@ def parse_cf_submission_rows(page: str) -> List[dict]:
             "status": status,
             "cells": cells,
             "submit_ts": _parse_submit_clock(cells),
+            "submit_time": submission_time_text(inner),
             "url_path": f"/submission/{sid}",
         })
     return rows
@@ -3954,15 +4229,15 @@ def fetch_cf_submission_rows(
     want = str(problem_id or "").upper()
     for url in urls:
         try:
-            _, _, page = client.get(url, timeout=timeout, retries=retries, fatal=False)
+            status, final, page = client.get(url, timeout=timeout, retries=retries, fatal=False)
+            validate_submission_page(status, final, page)
         except (TimeoutError, OSError) as exc:
             last_err = exc
             continue
         rows = parse_cf_submission_rows(page)
         if want:
             rows = [r for r in rows if str(r.get("problem_id") or "").upper() == want]
-        if rows:
-            return rows
+        return rows
     if last_err:
         raise last_err
     return []
@@ -3975,32 +4250,36 @@ def latest_ids(client: Client, contest: dict, problem_id: Optional[str] = None) 
     ]
 
 
+def is_new_submission_id(sid: str, before: Optional[List[str]]) -> bool:
+    # None means the pre-submit list could not be read; [] means it was empty.
+    return before is not None and sid.isdigit() and (not before or int(sid) > max(int(x) for x in before))
+
+
 def wait_for_new_sid(
     client: Client,
     contest: dict,
     problem_id: str,
-    before: List[str],
+    before: Optional[List[str]],
     seconds: float = 4,
 ) -> Optional[str]:
-    known = set(before)
-    deadline = time.time() + seconds
-    announced = False
-    while time.time() < deadline:
+    if before is None:
+        return None
+    info("正在核对新提交记录...")
+    deadline = time.monotonic() + seconds
+    fetch = fetch_cf_submission_rows if is_codeforces(contest.get("site") or "") else fetch_submission_rows
+    while time.monotonic() < deadline:
+        remaining = deadline - time.monotonic()
         try:
-            rows = fetch_submission_rows(
-                client, contest, problem_id, timeout=6, retries=0, site_wide=False
-            )
-            after = [r["id"] for r in rows]
+            kwargs = {"fallback": False} if is_codeforces(contest.get("site") or "") else {"site_wide": False}
+            rows = fetch(client, contest, problem_id, timeout=min(8, remaining), retries=0, **kwargs)
+            for row in rows:
+                if is_new_submission_id(row["id"], before):
+                    return row["id"]
         except (TimeoutError, OSError):
-            time.sleep(0.35)
-            continue
-        for item in after:
-            if item not in known:
-                return item
-        if not announced:
-            info("正在确认提交号...")
-            announced = True
-        time.sleep(0.35)
+            pass
+        remaining = deadline - time.monotonic()
+        if remaining > 0:
+            time.sleep(min(1, remaining))
     return None
 
 
@@ -4108,6 +4387,8 @@ def _load_submit_context(
         die("被 Cloudflare 拦截。请重新: python3 submit login")
     if not looks_logged_in(page, url, expect=expect) and "/login" in (url or ""):
         die("未登录或 Cookie 已过期。请先: python3 submit login")
+    if status != 200 or not _has_submit_form(page):
+        die("未找到有效提交表单，请检查比赛权限或重新登录")
     return problem_url, status, url, page, [], False, "", None
 
 
@@ -4123,9 +4404,9 @@ def _submit_codeforces(
     problem_url: str,
     url: str,
     page: str,
-    before: List[str],
+    before: Optional[List[str]],
     chosen_lang: Optional[str] = None,
-) -> None:
+) -> Optional[str]:
     csrf = extract_csrf(page) or extract_token(page)
     if not csrf:
         die("没有拿到 CSRF token。请先: python3 submit login cf")
@@ -4167,7 +4448,7 @@ def _submit_codeforces(
     info("正在提交...")
     try:
         status, resp_url, resp = client.post_form(
-            post_url, fields, referer=url or problem_url, follow_redirects=True
+            post_url, fields, referer=url or problem_url, follow_redirects=False, fatal=False
         )
     except TimeoutError:
         warn("提交响应超时，正在查是否已经交上去（不要重复提交）...")
@@ -4190,24 +4471,11 @@ def _submit_codeforces(
     if want:
         rows = [r for r in rows if str(r.get("problem_id") or "").upper() == want]
     for row in rows:
-        if row["id"] not in before:
+        if is_new_submission_id(row["id"], before):
             sid = row["id"]
             break
-    if not sid and ok_submit and rows:
-        sid = rows[0]["id"]
-    if not sid:
-        try:
-            extra = fetch_cf_submission_rows(
-                client, contest, letter, timeout=6, retries=0, fallback=False
-            )
-            for row in extra:
-                if row["id"] not in before:
-                    sid = row["id"]
-                    break
-            if not sid and ok_submit and extra:
-                sid = extra[0]["id"]
-        except (TimeoutError, OSError):
-            pass
+    if not sid and not ok_submit:
+        sid = wait_for_new_sid(client, contest, letter, before, seconds=20)
     board = str(contest["contest_url"]).rstrip("/") + "/my"
     if not ok_submit and not sid:
         die(
@@ -4221,6 +4489,7 @@ def _submit_codeforces(
     else:
         ok(f"已提交 {letter}")
     info(f"评测结果见 {board}")
+    return sid or None
 
 
 def extract_cf_error(page: str) -> str:
@@ -4241,6 +4510,8 @@ def extract_cf_error(page: str) -> str:
 
 
 def cmd_submit(args: argparse.Namespace) -> None:
+    if not getattr(args, "no_wait", False) and getattr(args, "wait", 300) <= 0:
+        die("--wait 必须大于 0；不等待请使用 --no-wait")
     cfg = load_global()
     if getattr(args, "contest", None):
         bind_contest(str(args.contest), debug=bool(args.debug), quiet=True)
@@ -4287,7 +4558,8 @@ def cmd_submit(args: argparse.Namespace) -> None:
         return
 
     client = make_client(cfg, contest, debug=args.debug)
-    expect = contest.get("username") or get_account(cfg, contest.get("site") or "").get("username") or ""
+    expect = get_account(cfg, contest.get("site") or "").get("username") or contest.get("username") or ""
+    contest["username"] = expect
     chosen_lang = lang
     before = [cached_sid] if cached_sid else []
     box: dict = {"data": None, "exc": None}
@@ -4295,6 +4567,7 @@ def cmd_submit(args: argparse.Namespace) -> None:
     def _prefetch() -> None:
         try:
             box["data"] = _load_submit_context(client, contest, problem, expect)
+            box["loaded_at"] = time.monotonic()
         except BaseException as exc:
             box["exc"] = exc
 
@@ -4312,16 +4585,16 @@ def cmd_submit(args: argparse.Namespace) -> None:
         exc = box["exc"]
         if isinstance(exc, SystemExit):
             raise exc
-        if not (
-            is_codeforces(contest.get("site") or "")
-            and isinstance(exc, (TimeoutError, OSError))
-        ):
+        if not isinstance(exc, (TimeoutError, OSError)):
             raise exc
         box["data"] = None
-    if box["data"] is None:
+    if box["data"] is None or time.monotonic() - box.get("loaded_at", 0) > 60:
         info("正在打开提交页...")
         client._rebuild_opener()
-        box["data"] = _load_submit_context(client, contest, problem, expect)
+        try:
+            box["data"] = _load_submit_context(client, contest, problem, expect)
+        except (TimeoutError, OSError) as exc:
+            die(f"获取提交表单失败，尚未发送代码: {exc}")
     problem_url, status, url, page, _hist, _list_timeout, _list_sid, _list_ts = box["data"]
     if is_codeforces(contest.get("site") or "") and not (
         extract_csrf(page) or extract_token(page)
@@ -4331,6 +4604,19 @@ def cmd_submit(args: argparse.Namespace) -> None:
         problem_url, status, url, page, _hist, _list_timeout, _list_sid, _list_ts = (
             _load_submit_context(client, contest, problem, expect)
         )
+    if not is_codeforces(contest.get("site") or ""):
+        current_user = extract_username(page) or expect
+        if not current_user:
+            die("无法确定提交账号，请重新运行 ./submit login")
+        contest["username"] = current_user
+    info("正在读取提交前记录...")
+    try:
+        fetch_rows = fetch_cf_submission_rows if is_codeforces(contest.get("site") or "") else fetch_submission_rows
+        baseline = fetch_rows(client, contest, str(problem["id"]), retries=1)
+        before = [row["id"] for row in baseline]
+    except (TimeoutError, OSError):
+        before = None
+        warn("提交前记录暂不可用，将依据服务器提交响应确认结果")
     fresh_name = parse_contest_name(
         page, contest.get("site") or "", str(contest.get("contest_id") or "")
     )
@@ -4353,7 +4639,7 @@ def cmd_submit(args: argparse.Namespace) -> None:
                 lang = chosen_lang
             else:
                 lang = pick_language(options, suffix, args.lang)
-        _submit_codeforces(
+        sid = _submit_codeforces(
             client,
             contest_path,
             contest,
@@ -4368,133 +4654,158 @@ def cmd_submit(args: argparse.Namespace) -> None:
             before,
             chosen_lang=lang,
         )
+        finish_submission(client, contest_path, contest, problem, sid, before, args)
         return
-    token = extract_token(page)
+    sid = _submit_qoj(client, contest_path, contest, problem, code, suffix, args.lang,
+                problem_url, url, page, before, chosen_lang=lang)
+    finish_submission(client, contest_path, contest, problem, sid, before, args)
+
+
+def _submit_qoj(client, contest_path, contest, problem, code, suffix, explicit_lang,
+                problem_url, url, page, before, chosen_lang=None):
+    form = next((m.group(0) for m in re.finditer(r"<form\b[^>]*>.*?</form>", page, re.I | re.S)
+                 if _has_submit_form(m.group(0))), "")
+    if not form:
+        die("未找到提交表单，尚未发送代码")
+    token = extract_token(form) or extract_token(page)
     if not token:
-        die("没有拿到 CSRF token，页面可能不是提交页")
-    if re.search(r'name=["\']answer_Anna_language["\']', page):
+        die("未找到提交 token，尚未发送代码")
+    if "answer_Anna_language" in form or "answer_Bruno_language" in form:
         die("这是交互/通信题（Anna/Bruno），请到网页提交")
-    parsed_field, parsed_opts = collect_language_options(page)
-    if parsed_opts:
-        lang_field, options = parsed_field, parsed_opts
-        if any(v == chosen_lang for v, _ in parsed_opts):
-            lang = chosen_lang
-        else:
-            lang = pick_language(options, suffix, args.lang)
-    btn_name, btn_val = extract_submit_button(page)
-
-    post_candidates: List[str] = []
-    for item in (
-        problem_url,
-        url.split("#")[0] if url else "",
-        extract_form_action(page, url or problem_url),
-        canonical_problem_url(problem_url) + "?tab=submit-answer",
-        canonical_problem_url(problem_url) + "/submit",
-        (url or problem_url).split("#")[0],
-    ):
-        item = (item or "").split("#")[0]
-        if item and item not in post_candidates:
-            post_candidates.append(item)
-
+    post_url = extract_form_action(form, url or problem_url) or problem_url
+    if urlparse(post_url).netloc != urlparse(client.site).netloc:
+        die("提交表单跳到了其他站点，尚未发送代码")
+    lang_field, options = collect_language_options(form)
+    if not options:
+        lang_field, options = "answer_answer_language", list(DEFAULT_QOJ_LANGS)
+    lang = chosen_lang if chosen_lang and any(v == chosen_lang for v, _ in options) else pick_language(options, suffix, explicit_lang)
+    fields = {}
+    for attrs in re.findall(r"<input\b([^>]*)>", form, re.I | re.S):
+        name = _html_attr(attrs, "name")
+        if name and _html_attr(attrs, "type").lower() == "hidden" and not re.search(r"\bdisabled(?:\s|=|$)", attrs, re.I):
+            fields[name] = _html_attr(attrs, "value")
+    btn_name, btn_val = extract_submit_button(form)
+    fields.update({"_token": token, lang_field: lang, "answer_answer_upload_type": "editor",
+                   "answer_answer_editor": code, btn_name: btn_val})
     info("正在提交...")
-    fields = {
-        "_token": token,
-        lang_field: lang,
-        "answer_answer_upload_type": "editor",
-        "answer_answer_editor": code,
-        btn_name: btn_val,
-    }
-    files = {
-        "answer_answer_file": ("", b"", "application/octet-stream"),
-    }
-    status, resp_url, resp = 0, "", ""
-    used_post = post_candidates[0]
-    timed_out = False
-    for post_url in post_candidates:
-        used_post = post_url
-        try:
-            status, resp_url, resp = client.post_multipart(
-                post_url, fields, files=files, referer=url or post_url, fatal=False
-            )
-        except TimeoutError:
-            warn("提交响应超时，正在查是否已经交上去（不要重复提交）...")
-            client._rebuild_opener()
-            timed_out = True
-            status, resp_url, resp = 0, "", ""
-            break
-        bounced = status in (301, 302, 303) and "/statement/" in (resp_url or "")
-        if bounced:
-            warn("这个地址会跳回题面，换 Submit 地址再试")
-            continue
-        break
-    else:
-        die(
-            "提交一直被重定向到题面页。QOJ 需要先打开题目再点 Submit。\n"
-            "请把浏览器地址栏在点击 Submit 之后的完整 URL 发过来。"
-        )
-    url = resp_url
-    if not timed_out:
-        alert = extract_alerts(resp)
-        if alert:
-            die(f"提交被拒绝: {alert}")
-        if "/login" in (url or ""):
-            die("提交时登录已失效，请 python3 submit login")
-        if status in (301, 302, 303) and "/statement/" in (url or ""):
-            die(
-                "提交被重定向到题面页，请求没有当成交题处理。\n"
-                "请在浏览器打开题目，点 Submit 确认能交，然后 ./submit status"
-            )
-        if status >= 400:
-            die(f"提交 HTTP {status}  {url}")
-
-    sid = None
-    loc_sid = re.search(r"/submission/(\d+)", url or "")
-    if loc_sid:
-        sid = loc_sid.group(1)
-    from_resp = [r["id"] for r in parse_submission_rows(resp)]
-    if not sid and ("/submissions" in (url or "") or "/submission/" in (url or "")):
-        for item in from_resp:
-            if item not in before:
-                sid = item
-                break
-        if not sid and from_resp:
-            sid = from_resp[0]
-    if not sid:
-        sid = wait_for_new_sid(
-            client, contest, problem["id"], before, seconds=8 if timed_out else 3
-        )
-
-    if sid and sid not in before:
-        board = f"{contest['contest_url'].rstrip('/')}/submissions"
+    status, response_url, response = 0, "", ""
+    try:
+        status, response_url, response = client.post_multipart(
+            post_url, fields, files={"answer_answer_file": ("", b"", "application/octet-stream")},
+            referer=url or post_url, timeout=30, fatal=False)
+    except (TimeoutError, OSError):
+        warn("提交响应中断，正在核对记录；不会重复发送代码")
+        client._rebuild_opener()
+    if "/login" in response_url:
+        die("提交时登录已失效，请运行 ./submit login")
+    errors = re.findall(r'<div\b[^>]*class=["\'][^"\']*alert-danger[^"\']*["\'][^>]*>(.*?)</div>', response, re.I | re.S)
+    if errors and status < 500:
+        die("提交被拒绝: " + " / ".join(strip_html(x) for x in errors))
+    board = str(contest["contest_url"]).rstrip("/") + "/submissions"
+    target = urlparse(response_url)
+    same_site = target.netloc == urlparse(client.site).netloc
+    direct = re.fullmatch(r"/(?:contest/\d+/)?submission/(\d+)/?", target.path) if same_site else None
+    sid = direct.group(1) if direct and 200 <= status < 400 else None
+    acknowledged = same_site and status in (301, 302, 303) and target.path.rstrip("/") == urlparse(board).path
+    if not sid and not acknowledged:
+        sid = wait_for_new_sid(client, contest, str(problem["id"]), before, seconds=20)
+    if sid:
+        remember_submit(contest_path, contest, str(problem["id"]), sid)
         ok(f"已提交 #{sid}")
-        remember_submit(contest_path, contest, problem["id"], sid)
-        info(f"评测结果见 {board}")
+    elif acknowledged:
+        ok("服务器已接收提交")
+    else:
+        die(f"暂时无法确认提交结果（HTTP {status}）。请先 ./submit status 或打开 {board} 核对，避免重复提交")
+    info(f"评测结果见 {board}")
+    return sid
+
+
+def finish_submission(client, contest_path, contest, problem, sid, before, args):
+    if getattr(args, "no_wait", False):
         return
-    if sid and sid in before:
-        die(
-            f"没有交上去。提交列表还是原来的 #{sid}。\n"
-            f"最终 URL: {url}\n"
-            f"标题: {_page_title(resp) or '(无)'}\n"
-            "请 ./submit status 核对，不要连续重复提交。"
-        )
-    die(
-        "没有交上去（提交响应超时或没有新的提交记录）。\n"
-        f"HTTP {status}  {url}\n"
-        f"标题: {_page_title(resp) or '(无)'}\n"
-        "请先 ./submit status 核对，不要连续重复提交。"
-    )
+    deadline = time.monotonic() + getattr(args, "wait", 300)
+    try:
+        if not sid:
+            sid = wait_for_new_sid(client, contest, str(problem["id"]), before,
+                                   seconds=max(0, deadline - time.monotonic()))
+            if sid:
+                remember_submit(contest_path, contest, str(problem["id"]), sid)
+        if not sid:
+            warn("提交已接收，但未能确定本次提交 ID；请先 status 核对，再用 watch <ID> 跟踪")
+            return
+        watch_submission(client, contest, sid, timeout=max(0, deadline - time.monotonic()))
+    except KeyboardInterrupt:
+        warn("已停止等待，提交仍在服务器评测；可用 status 查看")
 
 
-def watch_submission(_client, contest: dict, sid: str, timeout: int = 300) -> None:
+def fetch_submission_verdict(client, contest, sid, timeout=10):
+    deadline = time.monotonic() + timeout
+    cf = is_codeforces(contest.get("site") or "")
+    fetch = fetch_cf_submission_rows if cf else fetch_submission_rows
+    kwargs = {"fallback": False} if cf else {"site_wide": False}
+    rows = fetch(client, contest, timeout=timeout, retries=0, **kwargs)
+    for row in rows:
+        if row["id"] == sid:
+            return short_verdict(row["status"])
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        return "UNKNOWN"
+    # Older submissions may have moved beyond the first page.
+    base = contest["contest_url"] if cf else contest["site"]
+    status, url, page = client.get(base.rstrip("/") + "/submission/" + sid,
+                                    timeout=remaining, retries=0, fatal=False)
+    validate_submission_page(status, url, page)
+    head, _ = _split_submission_html(page)
+    parser = parse_cf_submission_rows if cf else parse_submission_rows
+    for row in parser(head):
+        if row["id"] == sid:
+            return short_verdict(row["status"])
+    # Do not infer an overall result from individual test results.
+    return short_verdict(_uoj_status_text(head))
+
+
+def watch_submission(client, contest: dict, sid: str, timeout: float = 300) -> bool:
     sid = str(sid).lstrip("#")
-    base = str(contest["contest_url"]).rstrip("/")
-    url = base + ("/my" if is_codeforces(contest.get("site") or "") else "/submissions")
-    info(f"评测结果见 {url}")
+    if not sid.isdigit():
+        die("提交 ID 必须是数字")
+    final = {"AC", "WA", "TLE", "MLE", "RE", "CE", "OLE", "JE", "PC", "RF",
+             "DGS", "PE", "NO_OUTPUT", "CANCELLED", "SKIPPED", "HACKED", "REJECT"}
+    deadline = time.monotonic() + timeout
+    last, failed = None, False
+    info(f"正在等待 #{sid} 的评测结果（Ctrl+C 停止等待）")
+    while time.monotonic() < deadline:
+        try:
+            verdict = fetch_submission_verdict(client, contest, sid,
+                                               timeout=min(10, max(0.1, deadline - time.monotonic())))
+            failed = False
+            if verdict != last:
+                print(f"#{sid}  {verdict_color(verdict)}", flush=True)
+                last = verdict
+            if verdict in final:
+                return True
+        except (TimeoutError, OSError):
+            if not failed:
+                warn("查询暂时失败，将继续核对评测状态，不会重复提交")
+            failed = True
+        remaining = deadline - time.monotonic()
+        if remaining > 0:
+            time.sleep(min(2, remaining))
+    warn(f"等待超时，#{sid} 尚未取得最终结果；可用 ./submit watch {sid} 继续查询")
+    return False
 
 
 def cmd_watch(args: argparse.Namespace) -> None:
+    if args.wait <= 0:
+        die("--wait 必须大于 0")
+    cfg = load_global()
     _, contest = require_contest()
-    watch_submission(None, contest, str(args.id).lstrip("#"))
+    contest = dict(contest)
+    contest["username"] = get_account(cfg, contest.get("site") or "").get("username") or contest.get("username") or ""
+    client = make_client(cfg, contest, debug=args.debug)
+    try:
+        watch_submission(client, contest, str(args.id).lstrip("#"), timeout=args.wait)
+    except KeyboardInterrupt:
+        warn("已停止等待；可用 status 查看评测结果")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -4530,7 +4841,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     po = sub.add_parser("logout", help="退出本地登录，以便换账号")
     po.add_argument("oj", nargs="?", default=None, help="qoj 或 cf")
-    sub.add_parser("whoami", help="检查当前登录")
+    who = sub.add_parser("whoami", help="立即显示本地账号")
+    who.add_argument("--check", action="store_true", help="联网验证登录状态")
+    who.add_argument("--timeout", type=float, default=15, help="在线验证总预算（秒），默认 15")
 
     pj = sub.add_parser("oj", help="选择或查看当前 OJ（qoj / cf）")
     pj.add_argument("name", nargs="?", default=None, help="qoj 或 cf")
@@ -4542,8 +4855,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     sub.add_parser("problems", aliases=["list"], help="列出题目")
 
-    ps = sub.add_parser("status", help="最近提交")
-    ps.add_argument("-n", "--limit", type=int, default=15)
+    ps = sub.add_parser("status", help="自己在本场的全部提交：ID、题号、状态、提交时间")
+    ps.add_argument("-n", "--limit", type=int, default=0, help="最多显示多少条，默认 0 表示全部")
 
     pw = sub.add_parser("watch", help="跟踪一次提交")
     pw.add_argument("id", help="提交号")
@@ -4556,7 +4869,7 @@ def looks_like_submit_target(arg: str) -> bool:
     if arg.startswith("-"):
         return False
     commands = {
-        "login", "logout", "init", "problems", "list", "status",
+        "login", "logout", "init", "contest", "problems", "list", "status",
         "watch", "whoami", "help", "cf", "codeforces", "gym", "qoj", "oj",
     }
     if arg in commands:
